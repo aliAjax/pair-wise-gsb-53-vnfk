@@ -17,7 +17,10 @@ DEFAULT_PORT = 8329
 def build_service(db_path: str) -> Service:
     repository = Repository(db_path)
     audit = AuditRecorder(repository)
-    return Service(repository, DomainRules(), audit)
+    rules = DomainRules()
+    name, rules_payload = rules.default_policy()
+    repository.ensure_seed_policy(name, rules_payload)
+    return Service(repository, rules, audit)
 
 
 def parse_args():

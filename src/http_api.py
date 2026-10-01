@@ -3,7 +3,7 @@ import json
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 from urllib.parse import parse_qs, urlparse
 
 from .domain import Actor, DomainError, PermissionDenied, ValidationError
@@ -16,7 +16,7 @@ AUDIT_RE = re.compile(r"^/api/records/(\d+)/audit$")
 
 def make_handler(service: Any, static_dir: Path):
     class Handler(BaseHTTPRequestHandler):
-        server_version = "immigration-deadline/1.0"
+        server_version = "immigration-deadline/2.0"
 
         def log_message(self, fmt: str, *args: Any) -> None:
             return
@@ -26,7 +26,10 @@ def make_handler(service: Any, static_dir: Path):
             role = self.headers.get("X-Role", "").strip()
             if not user_id or not role:
                 raise PermissionDenied("缺少X-User-Id或X-Role")
-            return Actor(user_id=user_id, role=role, organization=self.headers.get("X-Org", ""))
+            return Actor(user_id=user_id, role=role, organization=self.headers.get("X-Org", "").strip())
+
+        def _idem_key(self) -> Optional[str]:
+            return self.headers.get("Idempotency-Key", "").strip() or None
 
         def _body(self) -> Dict[str, Any]:
             try:
@@ -61,6 +64,13 @@ def make_handler(service: Any, static_dir: Path):
             else:
                 self._send(500, {"error": "internal_error", "message": "服务内部错误"})
 
+        @staticmethod
+        def _required_int(body: Dict[str, Any], key: str) -> int:
+            value = body.get(key)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValidationError("%s必须是整数" % key)
+            return value
+
         def do_GET(self) -> None:
             try:
                 parsed = urlparse(self.path)
@@ -75,6 +85,12 @@ def make_handler(service: Any, static_dir: Path):
                     query = parse_qs(parsed.query)
                     records = service.list_records(self._actor(), state=query.get("state", [None])[0], limit=int(query.get("limit", ["100"])[0]))
                     self._send(200, {"items": records})
+                    return
+                if parsed.path == "/api/policies":
+                    self._send(200, {"items": service.list_policies(self._actor())})
+                    return
+                if parsed.path == "/api/policies/current":
+                    self._send(200, service.current_policy(self._actor()))
                     return
                 match = RECORD_RE.match(parsed.path)
                 if match:
@@ -96,15 +112,39 @@ def make_handler(service: Any, static_dir: Path):
                 parsed = urlparse(self.path)
                 body = self._body()
                 if parsed.path == "/api/records":
-                    record = service.create(self._actor(), body.get("reference", ""), body.get("data", {}))
+                    record = service.create(
+                        self._actor(),
+                        body.get("reference", ""),
+                        body.get("data", {}),
+                        self._required_int(body, "expected_policy_version"),
+                        self._idem_key(),
+                    )
                     self._send(201, record)
+                    return
+                if parsed.path == "/api/policies":
+                    result = service.publish_policy(self._actor(), self._required_int(body, "expected_version"), body, self._idem_key())
+                    self._send(201, result)
+                    return
+                if parsed.path == "/api/policies/rollback":
+                    result = service.rollback_policy(
+                        self._actor(),
+                        self._required_int(body, "expected_version"),
+                        self._required_int(body, "to_version"),
+                        body.get("name"),
+                        self._idem_key(),
+                    )
+                    self._send(201, result)
                     return
                 match = ACTION_RE.match(parsed.path)
                 if match:
-                    version = body.get("expected_version")
-                    if not isinstance(version, int):
-                        raise ValidationError("expected_version必须是整数")
-                    record = service.act(self._actor(), int(match.group(1)), version, match.group(2), body.get("data", {}))
+                    record = service.act(
+                        self._actor(),
+                        int(match.group(1)),
+                        self._required_int(body, "expected_version"),
+                        match.group(2),
+                        body.get("data", {}),
+                        self._idem_key(),
+                    )
                     self._send(200, record)
                     return
                 self._send(404, {"error": "not_found", "message": "路径不存在"})
