@@ -15,9 +15,10 @@ DEFAULT_PORT = 8329
 
 
 def build_service(db_path: str) -> Service:
-    repository = Repository(db_path)
+    rules = DomainRules()
+    repository = Repository(db_path, rules)
     audit = AuditRecorder(repository)
-    return Service(repository, DomainRules(), audit)
+    return Service(repository, rules, audit)
 
 
 def parse_args():

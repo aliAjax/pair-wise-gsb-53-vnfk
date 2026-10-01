@@ -3,7 +3,7 @@ import json
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .domain import Actor, DomainError, PermissionDenied, ValidationError
@@ -12,6 +12,8 @@ from .domain import Actor, DomainError, PermissionDenied, ValidationError
 RECORD_RE = re.compile(r"^/api/records/(\d+)$")
 ACTION_RE = re.compile(r"^/api/records/(\d+)/actions/([a-z_]+)$")
 AUDIT_RE = re.compile(r"^/api/records/(\d+)/audit$")
+POLICY_VERSION_RE = re.compile(r"^/api/policies/(\d+)$")
+POLICY_ROLLBACK_RE = re.compile(r"^/api/policies/rollback/(\d+)$")
 
 
 def make_handler(service: Any, static_dir: Path):
@@ -26,9 +28,9 @@ def make_handler(service: Any, static_dir: Path):
             role = self.headers.get("X-Role", "").strip()
             if not user_id or not role:
                 raise PermissionDenied("缺少X-User-Id或X-Role")
-            return Actor(user_id=user_id, role=role, organization=self.headers.get("X-Org", ""))
+            return Actor(user_id=user_id, role=role, organization=self.headers.get("X-Org", "").strip())
 
-        def _body(self) -> Dict[str, Any]:
+        def _body(self) -> dict:
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError as exc:
@@ -71,6 +73,17 @@ def make_handler(service: Any, static_dir: Path):
                     page = (static_dir / "index.html").read_bytes()
                     self._send(200, page, "text/html; charset=utf-8")
                     return
+                if parsed.path == "/api/policies/current":
+                    self._send(200, service.current_policy(self._actor()))
+                    return
+                if parsed.path == "/api/policies":
+                    self._send(200, {"items": service.list_policies(self._actor())})
+                    return
+                match = POLICY_VERSION_RE.match(parsed.path)
+                if match:
+                    policy = service.get_policy(self._actor(), int(match.group(1)))
+                    self._send(200, policy)
+                    return
                 if parsed.path == "/api/records":
                     query = parse_qs(parsed.query)
                     records = service.list_records(self._actor(), state=query.get("state", [None])[0], limit=int(query.get("limit", ["100"])[0]))
@@ -95,14 +108,39 @@ def make_handler(service: Any, static_dir: Path):
             try:
                 parsed = urlparse(self.path)
                 body = self._body()
+                if parsed.path == "/api/policies":
+                    expected = body.get("expected_version")
+                    if not isinstance(expected, int) or isinstance(expected, bool):
+                        raise ValidationError("expected_version必须是整数")
+                    policy = service.publish_policy(self._actor(), expected, body.get("content", {}))
+                    self._send(201, policy)
+                    return
+                match = POLICY_ROLLBACK_RE.match(parsed.path)
+                if match:
+                    expected = body.get("expected_version")
+                    if expected is not None and (not isinstance(expected, int) or isinstance(expected, bool)):
+                        raise ValidationError("expected_version必须是整数")
+                    policy = service.rollback_policy(self._actor(), int(match.group(1)), expected)
+                    self._send(201, policy)
+                    return
                 if parsed.path == "/api/records":
-                    record = service.create(self._actor(), body.get("reference", ""), body.get("data", {}))
+                    expected_policy = body.get("expected_policy_version")
+                    if expected_policy is not None and (
+                        not isinstance(expected_policy, int) or isinstance(expected_policy, bool)
+                    ):
+                        raise ValidationError("expected_policy_version必须是整数")
+                    record = service.create(
+                        self._actor(),
+                        body.get("reference", ""),
+                        body.get("data", {}),
+                        expected_policy_version=expected_policy,
+                    )
                     self._send(201, record)
                     return
                 match = ACTION_RE.match(parsed.path)
                 if match:
                     version = body.get("expected_version")
-                    if not isinstance(version, int):
+                    if not isinstance(version, int) or isinstance(version, bool):
                         raise ValidationError("expected_version必须是整数")
                     record = service.act(self._actor(), int(match.group(1)), version, match.group(2), body.get("data", {}))
                     self._send(200, record)
